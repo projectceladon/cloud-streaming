@@ -1,0 +1,151 @@
+#!/bin/bash
+
+SELF=$(basename $0)
+
+function err() {
+  echo "ERR $SELF $$ ${FUNCNAME[1]}: $@" >&2
+}
+
+function dbg() {
+  echo "DBG $SELF $$ ${FUNCNAME[1]}: $@" >&2
+}
+
+function main() {
+  local uid=0
+  local gop=0
+  local user_count=${K8S_ENV_USER_COUNT_PER_ANDROID:-1}
+
+  local help=$(
+    cat <<EOF
+Usage: $SELF [-i <id>] [-u <uid>] [-h] <url>
+  Streamer provide streaming service between AIC and WebRTC client
+
+  -i <id>: instance ID, default: $id
+  -u <uid>: user id, default: 0
+  -g <gop_size>: gop size, default: $gop
+  -h:      print the usage message
+  <ip>:    ip to signaling server in format
+
+EOF
+  )
+
+  while getopts ":i:u:g:h" opt; do
+    case $opt in
+    i) id=$OPTARG ;;
+    u) uid=$OPTARG;;
+    g) gop=$OPTARG ;;
+    h) echo "$help" && exit ;;
+    *) echo "no such option: $opt" && exit 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  if [[ -n "$1" ]]; then
+    ip="$1"
+  else
+    err "signaling server ip is required"
+    echo "$help"
+    exit 1
+  fi
+
+  dbg "id is $id, user id is $uid"
+  dbg "ip is $ip"
+
+  if [[ "$K8S_ENV" == "true" ]]; then
+    sockpath=/conn/hwc-sock
+  else
+    sockpath=/opt/workdir/ipc/hwc-sock
+  fi
+
+  local w=${K8S_ENV_DISPLAY_RESOLUTION_X:-1280}
+  local h=${K8S_ENV_DISPLAY_RESOLUTION_Y:-720}
+
+  local y=${ICR_ON:-n}
+
+  if [[ "$K8S_ENV" == "true" ]]; then
+    local resourceAllocatedPath="/conn/resourceAllocated"
+    wait_file $resourceAllocatedPath
+    node="0"
+    for LINE in `cat $resourceAllocatedPath`
+    do
+        if [[ $LINE =~ "renderNode" ]]; then
+            OLD_IFS="$IFS"
+            IFS=","
+            arr=($LINE)
+            IFS="$OLD_IFS"
+            for s in ${arr[@]}
+            do
+              if [[ $s =~ "renderNode" ]]; then
+                    str="{\"renderNode\":\""
+                    start=${#str}
+                    length=$(expr ${#s}  - 1 - $start)
+                    if [ $length -ge 1 ] 2>/dev/null ; then
+                       tmp=${s:$start:$length}
+                       if [ $tmp -ge 0 ] 2>/dev/null; then
+                           node=$tmp
+                       fi
+                    fi
+              fi
+            done
+        else
+            echo "Render node hasn't been allocated."
+        fi
+    done
+    echo "node $node"
+    local INS_ON_NODE="$(expr $node + 128)"
+    local renderDevice="/dev/dri/renderD$INS_ON_NODE"
+    export VAAPI_DEVICE=$renderDevice
+    echo "Set env VAAPI_DEVICE: "$VAAPI_DEVICE
+  fi
+
+  local renderfps_enc_enable=${ENV_RENDERFPS_ENC_ENABLE:-"false"}
+  local hevc_enable=${HEVC_ENABLE:-"false"}
+  local codec="264"
+  if [[ "$hevc_enable" == "true" ]]; then
+      codec="265"
+  fi
+
+  local opts="$id -streaming -res ${w}x${h} -fr 30 -url irrv:${codec} -plugin qsv -lowpower -quality 4 -ratectrl VBR -b 3.3M -maxrate 6.6M -hwc_sock $sockpath"
+
+  if [[ $user_count -gt 1 ]]; then
+      opts="$opts -user $uid"
+  fi
+
+  #Set TCAE disabled by default
+  opts="$opts -tcae 0"
+
+  if [[ $gop -gt 0 ]]; then
+      opts="$opts -g $gop"
+  fi
+
+  if [[ "$renderfps_enc_enable" == "true" ]]; then
+      opts="$opts -renderfps_enc 1"
+  fi
+
+  dbg "opts:$opts"
+
+  while true; do
+     DISABLE_DYNAMIC_RESOLUTION=0 /opt/bin/icr_encoder $opts
+     echo "icr encoder exit, check logs"
+     sleep 2
+  done
+}
+
+function wait_file() {
+  dbg "wait for $1"
+  while [[ ! -e "$1" ]]; do
+    sleep 2
+  done
+  dbg "done"
+}
+
+function spin {
+  dbg "wait forever"
+  while true; do
+    sleep infinity &
+    wait $!
+  done
+}
+
+# here we go
+main "$@"
